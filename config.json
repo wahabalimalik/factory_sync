@@ -4,10 +4,14 @@
   "table_name": "full_data",
   "id_column": "ID",
 
+  "date_column": "date_1",
+  "start_date": "6/20/2026",
+
   "odoo_url": "https://dalbatest.odoo.com/api/full_data/import",
   "odoo_api_key": "9dad24891dfd36798fd4e525c0e14ba8bc80d986b96c049551b56ac49ab55f8b",
 
   "poll_interval_seconds": 60,
+  "batch_size": 200,
   "state_file": "sync_state.json",
   "log_file": "sync_agent.log"
 }

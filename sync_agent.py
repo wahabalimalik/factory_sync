@@ -84,8 +84,28 @@ try:
 
     import pyodbc
     import requests
+    import ssl
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.ssl_ import create_urllib3_context
 except Exception:
     fail_loudly("STARTUP FAILED while importing required libraries:", traceback.format_exc())
+
+
+class TLS12Adapter(HTTPAdapter):
+    """
+    Forces TLS 1.2+ for outgoing HTTPS requests.
+
+    Some older Windows machines default to TLS 1.0/1.1 at the OS level,
+    which modern hosts like Odoo.sh reject outright - this shows up as
+    a confusing "EOF occurred in violation of protocol" error rather
+    than a clear "TLS version not supported" message. This adapter
+    sidesteps the OS default entirely.
+    """
+    def init_poolmanager(self, *args, **kwargs):
+        ctx = create_urllib3_context()
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        kwargs["ssl_context"] = ctx
+        return super().init_poolmanager(*args, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -183,15 +203,30 @@ def json_safe(value):
 def fetch_new_rows(last_id):
     id_column = CONFIG.get("id_column", "ID")
     table_name = CONFIG["table_name"]
+    # Optional cutoff: only sync rows on/after this date. Leave the
+    # config value empty ("") to sync everything regardless of date.
+    start_date = CONFIG.get("start_date", "").strip()
+    date_column = CONFIG.get("date_column", "").strip()
 
     conn = get_connection()
     try:
         cursor = conn.cursor()
+
+        where_clauses = [f"[{id_column}] > ?"]
+        params = [last_id]
+
+        if start_date and date_column:
+            # Access uses #...# as date literals, but passing the value
+            # as a bound parameter is safer and handles formatting for us.
+            where_clauses.append(f"[{date_column}] >= ?")
+            params.append(start_date)
+
+        where_sql = " AND ".join(where_clauses)
         query = (
             f"SELECT * FROM [{table_name}] "
-            f"WHERE [{id_column}] > ? ORDER BY [{id_column}] ASC"
+            f"WHERE {where_sql} ORDER BY [{id_column}] ASC"
         )
-        cursor.execute(query, last_id)
+        cursor.execute(query, *params)
         columns = [col[0] for col in cursor.description]
         rows = []
         for row in cursor.fetchall():
@@ -204,15 +239,22 @@ def fetch_new_rows(last_id):
 # ---------------------------------------------------------------------------
 # Push to Odoo
 # ---------------------------------------------------------------------------
-def push_to_odoo(rows, id_column):
+def push_batch_to_odoo(rows, id_column):
+    """Send a single batch of rows to Odoo and return the parsed response."""
     url = CONFIG["odoo_url"]
     api_key = CONFIG.get("odoo_api_key", "")
     headers = {
-        "Content-Type": "application/json",
+        # NOT "application/json" - Odoo routes on this header and would
+        # try to treat it as internal JSON-RPC. The controller parses
+        # the raw body manually, so text/plain is correct here.
+        "Content-Type": "text/plain",
         "X-API-KEY": api_key,
     }
     payload = {"id_column": id_column, "records": rows}
-    response = requests.post(url, headers=headers, json=payload, timeout=30)
+
+    session = requests.Session()
+    session.mount("https://", TLS12Adapter())
+    response = session.post(url, headers=headers, data=json.dumps(payload), timeout=60)
     response.raise_for_status()
     return response.json()
 
@@ -233,6 +275,11 @@ signal.signal(signal.SIGINT, handle_stop)
 signal.signal(signal.SIGTERM, handle_stop)
 
 
+def chunked(items, size):
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+
+
 def run_cycle():
     state = load_state()
     last_id = state.get("last_id", 0)
@@ -242,23 +289,43 @@ def run_cycle():
         logger.info("No new rows since ID %s.", last_id)
         return
 
-    logger.info("Found %d new row(s). Sending to Odoo...", len(rows))
-    try:
-        result = push_to_odoo(rows, id_column)
-        logger.info("Odoo response: %s", result)
-        if result.get("status") != "ok" or "created_ids" not in result:
-            logger.error(
-                "Odoo response did not confirm success - NOT advancing checkpoint. "
-                "Will retry these same rows next cycle."
+    batch_size = CONFIG.get("batch_size", 250)
+    logger.info(
+        "Found %d new row(s). Sending to Odoo in batches of %d...",
+        len(rows), batch_size,
+    )
+
+    sent_count = 0
+    for batch in chunked(rows, batch_size):
+        try:
+            result = push_batch_to_odoo(batch, id_column)
+        except Exception:
+            logger.exception(
+                "Failed to push a batch to Odoo after %d row(s) sent successfully "
+                "this cycle - stopping here, will retry the remaining rows next cycle.",
+                sent_count,
             )
             return
-    except Exception:
-        logger.exception("Failed to push rows to Odoo - will retry next cycle.")
-        return
 
-    new_last_id = max(row[id_column] for row in rows)
-    save_state({"last_id": new_last_id})
-    logger.info("State updated. last_id is now %s.", new_last_id)
+        if result.get("status") != "ok" or "created_ids" not in result:
+            logger.error(
+                "Odoo response did not confirm success for a batch (response: %s) - "
+                "stopping here, will retry the remaining rows next cycle.", result,
+            )
+            return
+
+        batch_last_id = max(row[id_column] for row in batch)
+        save_state({"last_id": batch_last_id})
+        sent_count += len(batch)
+        logger.info(
+            "Batch OK - %d/%d rows sent so far this cycle. Checkpoint now at ID %s. "
+            "(%d created, %d already existed)",
+            sent_count, len(rows), batch_last_id,
+            len(result.get("created_ids", [])),
+            len(result.get("skipped_duplicate_ids", [])),
+        )
+
+    logger.info("Cycle complete - all %d row(s) processed.", len(rows))
 
 
 def main():
