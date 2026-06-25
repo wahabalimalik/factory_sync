@@ -69,6 +69,21 @@ let you download the finished file. You never touch Windows yourself.
 Whenever you change `sync_agent.py` in the future, just push the
 update to GitHub and a fresh exe builds automatically.
 
+### Option A2 — GitLab CI (same idea, if you prefer GitLab)
+
+This folder also includes `.gitlab-ci.yml` for the same purpose.
+
+1. Create a free account at gitlab.com if needed.
+2. Create a new **private** project.
+3. Upload everything from this `factory_sync` folder into it, making
+   sure `.gitlab-ci.yml` ends up at the project **root**.
+4. Go to **Build → Pipelines** — it runs automatically.
+5. Open the finished job → **Job artifacts** panel → download
+   `dist/sync_agent.exe`.
+
+Note: GitLab's Windows runners are currently in beta and can be a
+little slower to start than GitHub's, but work the same way.
+
 ### Option B — Build it yourself on any Windows PC with Python
 
 ```bash

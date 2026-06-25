@@ -204,6 +204,12 @@ def run_cycle():
     try:
         result = push_to_odoo(rows, id_column)
         logger.info("Odoo response: %s", result)
+        if result.get("status") != "ok" or "created_ids" not in result:
+            logger.error(
+                "Odoo response did not confirm success - NOT advancing checkpoint. "
+                "Will retry these same rows next cycle."
+            )
+            return
     except Exception:
         logger.exception("Failed to push rows to Odoo - will retry next cycle.")
         return  # do NOT advance last_id - retry the same rows next time
